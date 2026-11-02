@@ -1,0 +1,59 @@
+# Single iiwa14 with a Schunk WSG 50 body carrying UMI's soft fingers
+# (models/iiwa/wsg_umi/, 2026-10-24; before, the Finray fingers of
+# models/iiwa/wsg_finray/, which the bimanual scene keeps), welded to the
+# world at the origin. Same arm + gripper as the KMR scene.
+#
+# The `wsg::tool` frame is the benchmark's tracked end-effector frame: origin
+# between the fingertips, +z along the approach direction (out of the gripper),
+# +x along the finger opening. The tip plane lies at y = 0.1865 on the
+# `wsg::body` link (the body link sits at y = -0.049133 in the SDF's model
+# frame; the finger links at y = 0.014052 in that frame reach 0.123315
+# further, the UMI-3D finger's length). This is the UMI TCP convention
+# (finger tips); before 2026-10-23 the origin (0.135) lay 5.15 cm inside
+# the finger span. The fingers open along +-x on prismatic joints, default
+# 0.0453 each (0.0906 m, the datasets' maximum gripper_width); they are not
+# part of the benchmark's q.
+
+directives:
+
+- add_model:
+    name: iiwa
+    file: package://diffik_benchmark/models/iiwa/iiwa14_convex_decimated_collision.urdf
+
+- add_weld:
+    parent: world
+    child: iiwa::base
+
+- add_model:
+    name: wsg
+    file: package://diffik_benchmark/models/iiwa/wsg_umi/wsg50_umi_fingers.sdf
+    default_joint_positions:
+        left_finger_sliding_joint: [0.0453]
+        right_finger_sliding_joint: [0.0453]
+
+- add_frame:
+    name: iiwa::wsg_attach
+    X_PF:
+      base_frame: iiwa::iiwa_link_7
+      translation: [0, 0, 0.09]
+      rotation: !Rpy { deg: [90.0, 0.0, 68.0] }
+
+- add_weld:
+    parent: iiwa::wsg_attach
+    child: wsg::body
+
+- add_frame:
+    name: wsg::tool
+    X_PF:
+      base_frame: wsg::body
+      translation: [0, 0.1865, 0]
+      rotation: !Rpy { deg: [-90.0, 0.0, 0.0] }
+
+# The fingers slide on prismatic joints (inactive in the benchmark's q,
+# held at the default opening; the replay moves them). Welded fingers were
+# filtered against each other, the body and link 7 automatically; keep
+# exactly that pair set now that they are jointed.
+- add_collision_filter_group:
+    name: wsg_hand
+    members: [iiwa::iiwa_link_7, wsg::body, wsg::left_finger, wsg::right_finger]
+    ignored_collision_filter_groups: [wsg_hand]

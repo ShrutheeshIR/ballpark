@@ -48,10 +48,13 @@ class SphereDataStore:
             )
 
         # Store as mutable lists
-        self.data: dict[str, dict[str, list]] = {
+        # Cuboids (if any) are passed through untouched: this editor only edits
+        # spheres, but must not drop cuboids when saving.
+        self.data: dict[str, dict] = {
             link: {
                 "centers": [list(c) for c in v["centers"]],
                 "radii": list(v["radii"]),
+                **({"cuboids": v["cuboids"]} if "cuboids" in v else {}),
             }
             for link, v in raw.items()
         }

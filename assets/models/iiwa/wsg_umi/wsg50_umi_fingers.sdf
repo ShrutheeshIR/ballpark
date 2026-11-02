@@ -1,0 +1,150 @@
+<?xml version="1.0"?>
+<!-- Schunk WSG 50 body (from nepfaff's scene_gen_policy, as in wsg_finray/)
+     with two UMI-3D soft fingers on prismatic joints. The finger mesh is
+     the UMI-3D hardware release's soft_gripper_finger (see
+     meshes/README.md); its convex hull is the collision geometry, so the
+     visualization and the benchmark check the same shape. The tip plane
+     lies at y = 0.014052 + 0.123315 = 0.137367 in this model frame, i.e.
+     y = 0.1865 on the `body` link (which sits at y = -0.049133 here): the
+     benchmark's `wsg::tool` frame, UMI's TCP. Joint position 0 is closed
+     (the fingers' contact faces meet at x = 0); q > 0 opens each finger
+     along +-x, so the opening width is q_left + q_right. The default
+     opening is set in the directives (0.0906 m, the single-arm datasets'
+     maximum gripper_width). -->
+<sdf version="1.7">
+  <model name="wsg50_umi">
+    <link name="body">
+      <pose>0 -0.049133 0 0 0 0</pose>
+      <inertial>
+        <mass>0.988882</mass>
+        <inertia>
+          <ixx>0.162992</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.162992</iyy>
+          <iyz>0</iyz>
+          <izz>0.164814</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>package://drake_models/wsg_50_description/meshes/wsg_body.gltf</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.146 0.0725 0.05</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+    <!-- Finger link frames are aligned with the model frame, on the opening
+         axis at the finger base plane; the mesh rotation sits on the
+         geometry. Mesh frame: x contact face at 0 and body toward +x,
+         y width, z tip at -0.123315 and base at 0. Left: (x, y, z) ->
+         (-x, -z, -y); right: (x, y, z) -> (x, -z, y). -->
+    <link name="left_finger">
+      <pose>0 0.014052 0 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.16</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.16</iyy>
+          <iyz>0</iyz>
+          <izz>0.16</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <pose>0 0 0 1.5707963267948966 3.141592653589793 0</pose>
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>package://diffik_benchmark/models/iiwa/wsg_umi/meshes/umi_finger.obj</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <diffuse>0.12 0.42 0.85 1</diffuse>
+        </material>
+      </visual>
+      <collision name="collision">
+        <pose>0 0 0 1.5707963267948966 3.141592653589793 0</pose>
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>package://diffik_benchmark/models/iiwa/wsg_umi/meshes/umi_finger.obj</uri>
+            <drake:declare_convex/>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+    <link name="right_finger">
+      <pose>0 0.014052 0 0 0 0</pose>
+      <inertial>
+        <mass>0.05</mass>
+        <inertia>
+          <ixx>0.16</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.16</iyy>
+          <iyz>0</iyz>
+          <izz>0.16</izz>
+        </inertia>
+      </inertial>
+      <visual name="visual">
+        <pose>0 0 0 1.5707963267948966 0 0</pose>
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>package://diffik_benchmark/models/iiwa/wsg_umi/meshes/umi_finger.obj</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <diffuse>0.12 0.42 0.85 1</diffuse>
+        </material>
+      </visual>
+      <collision name="collision">
+        <pose>0 0 0 1.5707963267948966 0 0</pose>
+        <geometry>
+          <mesh>
+            <scale>1 1 1</scale>
+            <uri>package://diffik_benchmark/models/iiwa/wsg_umi/meshes/umi_finger.obj</uri>
+            <drake:declare_convex/>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+    <joint name="left_finger_sliding_joint" type="prismatic">
+      <parent>body</parent>
+      <child>left_finger</child>
+      <axis>
+        <xyz>-1 0 0</xyz>
+        <limit>
+          <lower>0</lower>
+          <upper>0.055</upper>
+          <effort>80</effort>
+          <velocity>0.42</velocity>
+        </limit>
+      </axis>
+    </joint>
+    <joint name="right_finger_sliding_joint" type="prismatic">
+      <parent>body</parent>
+      <child>right_finger</child>
+      <axis>
+        <xyz>1 0 0</xyz>
+        <limit>
+          <lower>0</lower>
+          <upper>0.055</upper>
+          <effort>80</effort>
+          <velocity>0.42</velocity>
+        </limit>
+      </axis>
+    </joint>
+    <static>0</static>
+  </model>
+</sdf>

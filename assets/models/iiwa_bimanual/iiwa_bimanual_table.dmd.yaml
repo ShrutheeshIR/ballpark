@@ -1,0 +1,79 @@
+# Bimanual iiwa14 + Finray WSG, no environment.
+#
+# Copied from rby1-constrained-planning/models/iiwa_bimanual_table_only.dmd.yaml
+# (itself iiwa-bimanual-augmented-jacobian-test's old_shelves.dmd.yaml minus
+# the shelves): same arm placement and gripper attachment. Adds a `tool`
+# frame per gripper (see models/iiwa/iiwa_finray.dmd.yaml). The table of the
+# source scene (a 5 x 5 m collision slab with its top at z = 0) is left out:
+# the benchmark has no scene obstacles, only self-collision, on every robot.
+# The dataset's table surface still maps to z = 0 (`ref_frame_height`).
+
+directives:
+
+# Left arm at the world origin.
+- add_model:
+    name: iiwa_left
+    file: package://diffik_benchmark/models/iiwa/iiwa14_convex_decimated_collision.urdf
+
+- add_weld:
+    parent: world
+    child: iiwa_left::base
+
+- add_model:
+    name: wsg_left
+    file: package://diffik_benchmark/models/iiwa/wsg_finray/wsg50_110_finray_fingers_box_collision.sdf
+
+- add_frame:
+    name: iiwa_left::wsg_attach
+    X_PF:
+      base_frame: iiwa_left::iiwa_link_7
+      translation: [0, 0, 0.09]
+      rotation: !Rpy { deg: [90.0, 0.0, 68.0] }
+
+- add_weld:
+    parent: iiwa_left::wsg_attach
+    child: wsg_left::body
+
+- add_frame:
+    name: wsg_left::tool
+    X_PF:
+      base_frame: wsg_left::body
+      translation: [0, 0.1865, 0]
+      rotation: !Rpy { deg: [-90.0, 0.0, 0.0] }
+
+# Right arm 0.765 m along +y.
+- add_model:
+    name: iiwa_right
+    file: package://diffik_benchmark/models/iiwa/iiwa14_convex_decimated_collision.urdf
+
+- add_frame:
+    name: iiwa_right_origin
+    X_PF:
+      base_frame: world
+      translation: [0, 0.765, 0]
+
+- add_weld:
+    parent: iiwa_right_origin
+    child: iiwa_right::base
+
+- add_model:
+    name: wsg_right
+    file: package://diffik_benchmark/models/iiwa/wsg_finray/wsg50_110_finray_fingers_box_collision.sdf
+
+- add_frame:
+    name: iiwa_right::wsg_attach
+    X_PF:
+      base_frame: iiwa_right::iiwa_link_7
+      translation: [0, 0, 0.09]
+      rotation: !Rpy { deg: [90.0, 0.0, 68.0] }
+
+- add_weld:
+    parent: iiwa_right::wsg_attach
+    child: wsg_right::body
+
+- add_frame:
+    name: wsg_right::tool
+    X_PF:
+      base_frame: wsg_right::body
+      translation: [0, 0.1865, 0]
+      rotation: !Rpy { deg: [-90.0, 0.0, 0.0] }

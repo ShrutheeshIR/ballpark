@@ -1,0 +1,28 @@
+# RB-Y1 with the holonomic-base HACK plus the benchmark's tool frames.
+#
+# The gripper fingers extend along -z of the `ee_left` / `ee_right` frames
+# (finger-tip plane at z = -0.1335 in gripper_sim.urdf, measured from the
+# EE_FINGER meshes on 2026-10-23) and close along x. The
+# `tool` frames put the origin between the fingertips with +z along the
+# approach direction, matching the iiwa scenes' `wsg::tool` convention.
+#
+# Placeholder until the real holonomic-base RB-Y1 model is available.
+
+directives:
+
+- add_directives:
+    file: package://diffik_benchmark/models/rby1/add_rby1_sim_with_holonomic_base_actuators.dmd.yaml
+
+- add_frame:
+    name: left_arm::tool
+    X_PF:
+      base_frame: left_arm::ee_left
+      translation: [0, 0, -0.1335]
+      rotation: !Rpy { deg: [180.0, 0.0, 0.0] }
+
+- add_frame:
+    name: right_arm::tool
+    X_PF:
+      base_frame: right_arm::ee_right
+      translation: [0, 0, -0.1335]
+      rotation: !Rpy { deg: [180.0, 0.0, 0.0] }

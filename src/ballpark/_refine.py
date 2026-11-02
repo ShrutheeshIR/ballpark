@@ -14,6 +14,7 @@ import jaxls
 from loguru import logger
 
 from ._spherize import Sphere
+from ._cuboid import Cuboid, cuboid_sdf
 from ._config import RefineParams
 
 
@@ -79,6 +80,12 @@ class _FlattenedSphereData:
     # FK transforms for self-collision
     sphere_transforms: jnp.ndarray  # (N, 7) FK transform (wxyz+xyz) per sphere
 
+    # Fixed cuboid obstacles (not optimized), padded to at least one entry
+    cuboid_centers: jnp.ndarray  # (M, 3) in link frame
+    cuboid_half_extents: jnp.ndarray  # (M, 3)
+    cuboid_wxyz: jnp.ndarray  # (M, 4)
+    cuboid_transforms: jnp.ndarray  # (M, 7) FK transform of each cuboid's link
+
     # Metadata (static - not traced by JAX)
     link_sphere_ranges: jdc.Static[tuple[tuple[int, int], ...]]
     link_point_ranges: jdc.Static[tuple[tuple[int, int], ...]]
@@ -99,6 +106,7 @@ def _build_flattened_sphere_data(
     link_names: list[str],
     Ts: np.ndarray,
     link_name_to_idx: dict[str, int],
+    link_cuboids: dict[str, list[Cuboid]] | None = None,
 ) -> _FlattenedSphereData | None:
     """Flatten per-link sphere/point dicts into arrays for JAX optimization.
 
@@ -186,8 +194,18 @@ def _build_flattened_sphere_data(
         sphere_transforms_list.extend([T] * n_in_link)
     sphere_transforms = jnp.array(sphere_transforms_list)
 
+    # Fixed cuboid obstacles, in a stable (sorted by link) order. Cuboid indices
+    # refer to this order (see _flatten_cuboids).
+    cub_c, cub_h, cub_q, cub_T, _ = _flatten_cuboids(
+        link_cuboids or {}, Ts, link_name_to_idx
+    )
+
     return _FlattenedSphereData(
         spheres=spheres,
+        cuboid_centers=cub_c,
+        cuboid_half_extents=cub_h,
+        cuboid_wxyz=cub_q,
+        cuboid_transforms=cub_T,
         points_all=points_all,
         sphere_to_link=sphere_to_link,
         point_to_link=point_to_link,
@@ -198,6 +216,43 @@ def _build_flattened_sphere_data(
         n_spheres=n_spheres,
         n_links=n_links,
         scale=scale,
+    )
+
+
+def _flatten_cuboids(
+    link_cuboids: dict[str, list[Cuboid]],
+    Ts: np.ndarray,
+    link_name_to_idx: dict[str, int],
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, list[str]]:
+    """Flatten cuboids into arrays; returns (centers, halves, wxyz, transforms, owner link per cuboid).
+
+    Always returns at least one (dummy) row so shapes are valid; the owner list
+    has no entry for the dummy.
+    """
+    centers, halves, quats, transforms, owners = [], [], [], [], []
+    for link_name in sorted(link_cuboids):
+        if link_name not in link_name_to_idx:
+            continue
+        for c in link_cuboids[link_name]:
+            centers.append(np.asarray(c.center))
+            halves.append(np.asarray(c.half_extents))
+            quats.append(np.asarray(c.wxyz))
+            transforms.append(Ts[link_name_to_idx[link_name]])
+            owners.append(link_name)
+    if not centers:
+        return (
+            jnp.zeros((1, 3)),
+            jnp.full((1, 3), 1e-3),
+            jnp.array([[1.0, 0.0, 0.0, 0.0]]),
+            jnp.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+            owners,
+        )
+    return (
+        jnp.array(centers),
+        jnp.array(halves),
+        jnp.array(quats),
+        jnp.array(transforms),
+        owners,
     )
 
 
@@ -377,6 +432,59 @@ def _self_collision_cost(
     return jnp.sqrt(lambda_self_collision) * penetration
 
 
+@jaxls.Cost.factory
+def _sphere_cuboid_cost(
+    vals: jaxls.VarValues,
+    sphere_var: SphereVar,
+    sphere_transform: jax.Array,
+    cuboid_center: jax.Array,
+    cuboid_half_extents: jax.Array,
+    cuboid_wxyz: jax.Array,
+    cuboid_transform: jax.Array,
+    lambda_self_collision: float,
+) -> jax.Array:
+    """Penalize penetration between an optimized sphere and a fixed cuboid.
+
+    The sphere center is moved into the cuboid's link frame, where the box
+    signed distance is evaluated; penetration = max(0, radius - sdf).
+    """
+    sphere = vals[sphere_var]
+    center_world = _transform_point(sphere.center, sphere_transform)
+    so3_c = jaxlie.SO3(wxyz=cuboid_transform[:4])
+    center_in_cuboid_link = so3_c.inverse() @ (center_world - cuboid_transform[4:])
+    sdf = cuboid_sdf(
+        center_in_cuboid_link[None, :], cuboid_center, cuboid_half_extents, cuboid_wxyz
+    )[0]
+    penetration = jnp.maximum(0.0, sphere.radius - sdf)
+    return jnp.sqrt(lambda_self_collision) * penetration
+
+
+def _build_sphere_cuboid_pairs(
+    link_names: list[str],
+    link_sphere_ranges: list[tuple[int, int]],
+    cuboid_owners: list[str],
+    non_contiguous_pairs: list[tuple[str, str]],
+    excluded_pairs: set[tuple[str, str]] | None = None,
+) -> list[tuple[int, int]]:
+    """(sphere_idx, cuboid_idx) pairs between non-adjacent links."""
+    allowed = set()
+    for a, b in non_contiguous_pairs:
+        if excluded_pairs and ((a, b) in excluded_pairs or (b, a) in excluded_pairs):
+            continue
+        allowed.add((a, b))
+        allowed.add((b, a))
+
+    name_to_range = {
+        name: link_sphere_ranges[i] for i, name in enumerate(link_names)
+    }
+    pairs: list[tuple[int, int]] = []
+    for cuboid_idx, owner in enumerate(cuboid_owners):
+        for link_name, (start, end) in name_to_range.items():
+            if (link_name, owner) in allowed:
+                pairs.extend((i, cuboid_idx) for i in range(start, end))
+    return pairs
+
+
 def _build_collision_pairs(
     link_names: list[str],
     link_sphere_ranges: list[tuple[int, int]],
@@ -435,6 +543,7 @@ def _build_jaxls_costs(
     data: _FlattenedSphereData,
     params: RefineParams,
     collision_pairs: list[tuple[int, int]],
+    cuboid_pairs: list[tuple[int, int]] = [],  # noqa: B006 (read-only)
 ) -> list[jaxls.Cost]:
     """Build optimization costs for sphere refinement.
 
@@ -548,6 +657,20 @@ def _build_jaxls_costs(
             )
         )
 
+    # Sphere vs fixed-cuboid collision costs
+    for i, j in cuboid_pairs:
+        costs.append(
+            _sphere_cuboid_cost(
+                SphereVar(i),
+                data.sphere_transforms[i],
+                data.cuboid_centers[j],
+                data.cuboid_half_extents[j],
+                data.cuboid_wxyz[j],
+                data.cuboid_transforms[j],
+                params.lambda_self_collision,
+            )
+        )
+
     return costs
 
 
@@ -563,6 +686,7 @@ def _run_robot_optimization(
     n_iters: jdc.Static[int],
     tol: float,
     collision_pairs: jdc.Static[tuple[tuple[int, int], ...]],
+    cuboid_pairs: jdc.Static[tuple[tuple[int, int], ...]] = (),
 ) -> tuple[Sphere, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Run the full optimization loop using jaxls nonlinear least squares.
 
@@ -572,6 +696,7 @@ def _run_robot_optimization(
         n_iters: Maximum number of optimization iterations
         tol: Relative convergence tolerance for early stopping
         collision_pairs: Static tuple of (sphere_idx_i, sphere_idx_j) pairs
+        cuboid_pairs: Static tuple of (sphere_idx, cuboid_idx) pairs
 
     Returns:
         Tuple of (final_spheres, init_loss, final_loss, n_steps)
@@ -582,7 +707,9 @@ def _run_robot_optimization(
     sphere_vars = SphereVar(jnp.arange(n_spheres))
 
     # Build costs
-    costs = _build_jaxls_costs(data, params, list(collision_pairs))
+    costs = _build_jaxls_costs(
+        data, params, list(collision_pairs), list(cuboid_pairs)
+    )
 
     if not costs:
         # No costs to optimize, return initial spheres
@@ -667,6 +794,7 @@ def refine_robot_spheres(
     refine_params: RefineParams | None = None,
     joint_cfg: np.ndarray | None = None,
     excluded_pairs: set[tuple[str, str]] | None = None,
+    link_cuboids: dict[str, list[Cuboid]] | None = None,
 ) -> dict[str, list[Sphere]]:
     """
     Refine sphere parameters for all robot links jointly.
@@ -688,6 +816,8 @@ def refine_robot_spheres(
         joint_cfg: Joint configuration for FK computation. If None, uses middle of
             joint limits.
         excluded_pairs: Link pairs to skip for collision checking (user-disabled).
+        link_cuboids: Optional fixed cuboids per link. They are not optimized;
+            spheres on non-adjacent links are penalized for penetrating them.
 
     Returns:
         Dict mapping link names to refined lists of Sphere objects
@@ -718,7 +848,7 @@ def refine_robot_spheres(
 
     # Build flattened data (with transforms)
     flat_data = _build_flattened_sphere_data(
-        link_spheres, link_points, link_names, Ts, link_name_to_idx
+        link_spheres, link_points, link_names, Ts, link_name_to_idx, link_cuboids
     )
 
     if flat_data is None:
@@ -742,6 +872,22 @@ def refine_robot_spheres(
                 f"across {len(valid_link_pairs)} link pairs"
             )
 
+    # Sphere vs fixed-cuboid pairs
+    cuboid_pairs: list[tuple[int, int]] = []
+    if p.lambda_self_collision > 0 and link_cuboids:
+        _, _, _, _, cuboid_owners = _flatten_cuboids(
+            link_cuboids, Ts, link_name_to_idx
+        )
+        cuboid_pairs = _build_sphere_cuboid_pairs(
+            list(flat_data.link_names),
+            list(flat_data.link_sphere_ranges),
+            cuboid_owners,
+            non_contiguous_pairs,
+            excluded_pairs,
+        )
+        if cuboid_pairs:
+            logger.info(f"Cuboid collision: checking {len(cuboid_pairs)} sphere-cuboid pairs")
+
     # Run optimization
     final_spheres, init_loss, final_loss, n_steps = _run_robot_optimization(
         flat_data,
@@ -749,6 +895,7 @@ def refine_robot_spheres(
         p.n_iters,
         p.tol,
         tuple(collision_pairs),
+        tuple(cuboid_pairs),
     )
 
     logger.info(

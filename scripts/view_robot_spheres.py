@@ -49,7 +49,11 @@ def main(
         return
 
     total = sum(len(v["radii"]) for v in data.values())
-    print(f"Loaded {total} spheres across {len(data)} links from {json_path}")
+    n_cuboids = sum(len(v.get("cuboids", {}).get("centers", [])) for v in data.values())
+    print(
+        f"Loaded {total} spheres and {n_cuboids} cuboids across {len(data)} links "
+        f"from {json_path}"
+    )
 
     # Load robot
     print(f"Loading robot: {robot_name}...")
@@ -95,7 +99,7 @@ def main(
     # Create sphere visuals
     link_names = robot.links
     frames: dict[str, viser.FrameHandle] = {}
-    handles: dict[str, viser.IcosphereHandle] = {}
+    handles: dict[str, viser.SceneNodeHandle] = {}
 
     def rebuild_spheres(opacity: float, visible: bool) -> None:
         # Clear existing
@@ -117,6 +121,27 @@ def main(
             radii = data[link_name]["radii"]
             color = SPHERE_COLORS[link_idx % len(SPHERE_COLORS)]
             rgb = (color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
+
+            cub = data[link_name].get("cuboids")
+            if cub:
+                for i, (c, h, q) in enumerate(
+                    zip(cub["centers"], cub["half_extents"], cub["wxyz"])
+                ):
+                    key = f"{link_name}_cuboid_{i}"
+                    frames[key] = server.scene.add_frame(
+                        f"/sphere_frames/{key}",
+                        wxyz=(1, 0, 0, 0),
+                        position=(0, 0, 0),
+                        show_axes=False,
+                    )
+                    handles[key] = server.scene.add_box(
+                        f"/sphere_frames/{key}/cuboid",
+                        dimensions=tuple(2.0 * np.asarray(h)),
+                        wxyz=np.asarray(q),
+                        position=np.asarray(c),
+                        color=rgb,
+                        opacity=opacity,
+                    )
 
             for i, (center, radius) in enumerate(zip(centers, radii)):
                 key = f"{link_name}_{i}"
@@ -142,8 +167,10 @@ def main(
                 continue
             T = Ts[link_idx]
             wxyz, pos = T[:4], T[4:]
-            for i in range(len(data[link_name]["radii"])):
-                key = f"{link_name}_{i}"
+            keys = [f"{link_name}_{i}" for i in range(len(data[link_name]["radii"]))]
+            n_cub = len(data[link_name].get("cuboids", {}).get("centers", []))
+            keys += [f"{link_name}_cuboid_{i}" for i in range(n_cub)]
+            for key in keys:
                 if key in frames:
                     frames[key].wxyz = wxyz
                     frames[key].position = pos

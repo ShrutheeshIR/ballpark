@@ -18,6 +18,9 @@ def main(
     target_spheres: int = 40,
     output_path: Path = Path("spheres.json"),
     refine: bool = False,
+    default_mode: Literal["sphere", "cuboid", "auto"] = "sphere",
+    cuboid_links: tuple[str, ...] = (),
+    sphere_links: tuple[str, ...] = (),
 ) -> None:
     """Compute sphere decomposition for a robot URDF.
 
@@ -26,10 +29,16 @@ def main(
         target_spheres: Target sphere count across robot.
         output_path: Output JSON file path.
         refine: If True, optimize sphere positions and radii using gradient descent.
+        default_mode: Primitive for links not listed below ("auto" picks the tighter
+            of spheres/cuboids per link).
+        cuboid_links: Links to approximate with cuboids instead of the default.
+        sphere_links: Links to approximate with spheres instead of the default.
 
     Examples:
         python scripts/spherize_robot.py --robot-name panda
         python scripts/spherize_robot.py --robot-name panda --refine
+        python scripts/spherize_robot.py --default-mode auto
+        python scripts/spherize_robot.py --cuboid-links panda_link2 panda_link4
     """
     # Load URDF.
     # You could alternatively load from a file directly:
@@ -48,7 +57,16 @@ def main(
     robot = Robot(urdf_obj)
 
     logger.info(f"Computing spheres (target={target_spheres})...")
-    result = robot.spherize(target_spheres=target_spheres)
+    link_modes = {name: "sphere" for name in sphere_links}
+    link_modes.update({name: "cuboid" for name in cuboid_links})
+    unknown = set(link_modes) - set(robot.collision_links)
+    if unknown:
+        raise ValueError(f"Unknown links: {sorted(unknown)}")
+    result = robot.spherize(
+        target_spheres=target_spheres,
+        link_modes=link_modes,  # type: ignore[arg-type]
+        default_mode=default_mode,
+    )
 
     # Optionally refine spheres
     if refine:
@@ -58,7 +76,8 @@ def main(
     # Export to JSON
     result.save_json(output_path)
     logger.info(
-        f"Exported spheres to {output_path} (total spheres={result.num_spheres})"
+        f"Exported to {output_path} (spheres={result.num_spheres}, "
+        f"cuboids={result.num_cuboids})"
     )
 
 

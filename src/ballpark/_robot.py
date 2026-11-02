@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import jaxlie
@@ -13,6 +13,13 @@ from scipy.spatial.transform import Rotation
 from loguru import logger
 
 from ._config import BallparkConfig, SpherePreset, SpherizeParams
+from ._cuboid import (
+    Cuboid,
+    PrimitiveMode,
+    cuboid_sdf,
+    cuboidize,
+    transform_cuboid,
+)
 from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
 from ._refine import refine_robot_spheres
@@ -21,26 +28,53 @@ from .utils._hash_geometry import get_link_collision_fingerprint
 
 @dataclass
 class RobotSpheresResult:
-    """Result from robot spherization."""
+    """Result from robot spherization.
+
+    Each link is approximated either by spheres (``link_spheres``) or cuboids
+    (``link_cuboids``). A link in cuboid mode has an empty sphere list.
+    """
 
     link_spheres: dict[str, list[Sphere]]
+    link_cuboids: dict[str, list[Cuboid]] = field(default_factory=dict)
 
     @property
     def num_spheres(self) -> int:
         """Total number of spheres across all links."""
         return sum(len(spheres) for spheres in self.link_spheres.values())
 
+    @property
+    def num_cuboids(self) -> int:
+        """Total number of cuboids across all links."""
+        return sum(len(cuboids) for cuboids in self.link_cuboids.values())
+
+    @property
+    def num_primitives(self) -> int:
+        return self.num_spheres + self.num_cuboids
+
     def save_json(self, path: Path) -> None:
-        """Save spheres to JSON file."""
+        """Save primitives to JSON file.
+
+        Per link: ``centers``/``radii`` for spheres (always present, for
+        backward compatibility) and, only if the link has cuboids, a ``cuboids``
+        entry with ``centers``, ``half_extents`` and ``wxyz`` (link frame).
+        """
         import json
 
-        data = {
-            link_name: {
-                "centers": [s.center.tolist() for s in spheres],
+        data: dict[str, dict] = {}
+        for link_name in {**self.link_spheres, **self.link_cuboids}:
+            spheres = self.link_spheres.get(link_name, [])
+            entry: dict = {
+                "centers": [np.asarray(s.center).tolist() for s in spheres],
                 "radii": [float(s.radius) for s in spheres],
             }
-            for link_name, spheres in self.link_spheres.items()
-        }
+            cuboids = self.link_cuboids.get(link_name, [])
+            if cuboids:
+                entry["cuboids"] = {
+                    "centers": [np.asarray(c.center).tolist() for c in cuboids],
+                    "half_extents": [np.asarray(c.half_extents).tolist() for c in cuboids],
+                    "wxyz": [np.asarray(c.wxyz).tolist() for c in cuboids],
+                }
+            data[link_name] = entry
         with path.open(mode="w") as f:
             json.dump(data, f, indent=2)
 
@@ -423,9 +457,11 @@ class Robot:
         allocation: dict[str, int] | None = None,
         config: BallparkConfig | None = None,
         sync_similar: bool = True,
+        link_modes: dict[str, PrimitiveMode] | None = None,
+        default_mode: PrimitiveMode = "sphere",
     ) -> RobotSpheresResult:
         """
-        Generate spheres for the robot.
+        Generate spheres and/or cuboids for the robot.
 
         Args:
             target_spheres: Total spheres (auto-allocates). Mutually exclusive with allocation.
@@ -433,9 +469,14 @@ class Robot:
             config: Configuration for spherization. If None, uses BALANCED preset.
             sync_similar: If True and allocation is provided, sync similar links to the
                 highest count in each similarity group (with warning). Default True.
+            link_modes: Per-link primitive: "sphere", "cuboid", or "auto" (fit both
+                and keep the tighter one). Links not listed use ``default_mode``.
+                Links in a similarity group follow the group's primary link.
+            default_mode: Primitive for links not in ``link_modes``.
 
         Returns:
-            RobotSpheresResult with link_spheres
+            RobotSpheresResult with link_spheres and link_cuboids. For a cuboid
+            link the allocation is the maximum number of cuboids.
 
         Raises:
             ValueError: If neither or both of target_spheres and allocation are provided.
@@ -457,6 +498,8 @@ class Robot:
             link_budgets=allocation,
             similarity_result=self._similarity,
             spherize_params=cfg.spherize,
+            link_modes=link_modes,
+            default_mode=default_mode,
         )
 
     def refine(
@@ -469,7 +512,8 @@ class Robot:
         """
         Refine sphere parameters using gradient-based optimization.
 
-        Jointly optimizes all spheres with:
+        Jointly optimizes all spheres (cuboids are kept as-is, and spheres are
+        pushed out of them) with:
         - Per-link losses: coverage, volume, overlap, uniformity
         - Robot-level losses: self-collision avoidance, similarity matching
 
@@ -495,8 +539,13 @@ class Robot:
             refine_params=cfg.refine,
             joint_cfg=joint_cfg,
             excluded_pairs=excluded_pairs,
+            link_cuboids=spheres_result.link_cuboids,
         )
-        return RobotSpheresResult(link_spheres=refined_link_spheres)
+        # Cuboids are not optimized; they act as fixed obstacles for the spheres.
+        return RobotSpheresResult(
+            link_spheres=refined_link_spheres,
+            link_cuboids=spheres_result.link_cuboids,
+        )
 
     def check_self_collision(
         self,
@@ -653,30 +702,72 @@ def _allocate_spheres_for_robot(
     return allocation
 
 
+def _auto_slack(
+    mesh: trimesh.Trimesh,
+    spheres: list[Sphere],
+    cuboids: list[Cuboid],
+    n_mc: int = 20000,
+    seed: int = 0,
+) -> float:
+    """Score a primitive set: union volume / convex hull volume, penalizing gaps.
+
+    Monte-Carlo estimate over the mesh bounding box. Lower is better.
+    """
+    from scipy.spatial import ConvexHull
+
+    rng = np.random.default_rng(seed)
+    lo, hi = mesh.bounds
+    pts = rng.uniform(lo, hi, size=(n_mc, 3))
+
+    inside = np.zeros(len(pts), dtype=bool)
+    for s in spheres:
+        inside |= np.linalg.norm(pts - np.asarray(s.center), axis=1) <= float(s.radius)
+    for c in cuboids:
+        inside |= np.asarray(cuboid_sdf(pts, c.center, c.half_extents, c.wxyz)) <= 0.0
+    union_vol = inside.mean() * float(np.prod(hi - lo))
+
+    hull = ConvexHull(mesh.vertices)
+    surf = np.asarray(mesh.sample(2000))
+    covered = np.zeros(len(surf), dtype=bool)
+    for s in spheres:
+        covered |= np.linalg.norm(surf - np.asarray(s.center), axis=1) <= float(s.radius)
+    for c in cuboids:
+        covered |= np.asarray(cuboid_sdf(surf, c.center, c.half_extents, c.wxyz)) <= 0.0
+    coverage = covered.mean()
+
+    return float(union_vol / (hull.volume + 1e-10)) * (1.0 + 5.0 * (1.0 - coverage))
+
+
 def _compute_spheres_for_robot(
     link_meshes: dict[str, trimesh.Trimesh],
     links: list[str],
     link_budgets: dict[str, int],
     similarity_result: SimilarityResult | None = None,
     spherize_params: SpherizeParams | None = None,
+    link_modes: dict[str, PrimitiveMode] | None = None,
+    default_mode: PrimitiveMode = "sphere",
 ) -> RobotSpheresResult:
     """
-    Compute spheres for all links.
+    Compute spheres and/or cuboids for all links.
 
     Args:
         link_meshes: Dict mapping link names to their collision meshes.
         links: List of link names
-        link_budgets: Dict mapping link names to sphere counts
-        similarity_result: Optional similarity info for reusing spheres
+        link_budgets: Dict mapping link names to primitive counts
+        similarity_result: Optional similarity info for reusing primitives
         spherize_params: Parameters for the spherization algorithm
+        link_modes: Per-link primitive mode (see Robot.spherize)
+        default_mode: Mode for links not in link_modes
 
     Returns:
-        RobotSpheresResult with link_spheres
+        RobotSpheresResult with link_spheres and link_cuboids
     """
     params = spherize_params or SpherizeParams()
+    modes = link_modes or {}
     link_spheres: dict[str, list[Sphere]] = {}
+    link_cuboids: dict[str, list[Cuboid]] = {}
 
-    # Build map of which links can reuse spheres from others
+    # Build map of which links can reuse primitives from others
     reuse_from: dict[str, str] = {}
     if similarity_result is not None:
         for group in similarity_result.groups:
@@ -684,31 +775,63 @@ def _compute_spheres_for_robot(
             for other in group[1:]:
                 reuse_from[other] = primary
 
-    # Spherize each link
     for link_name in links:
         budget = link_budgets.get(link_name, 1)
+        mode = modes.get(link_name, default_mode)
 
         # Check if we can reuse from a similar link
         if link_name in reuse_from and similarity_result is not None:
             primary = reuse_from[link_name]
             if primary in link_spheres:
-                # Transform spheres from primary to this link
                 transform = similarity_result.transforms.get((primary, link_name))
                 if transform is not None:
+                    if modes.get(primary, default_mode) != mode:
+                        logger.warning(
+                            f"Link '{link_name}' is similar to '{primary}'; using "
+                            f"its primitive type instead of mode '{mode}'"
+                        )
                     link_spheres[link_name] = _transform_spheres(
                         link_spheres[primary], transform
                     )
+                    link_cuboids[link_name] = [
+                        transform_cuboid(c, transform)
+                        for c in link_cuboids.get(primary, [])
+                    ]
                     continue
 
-        # Spherize this link
         mesh = link_meshes.get(link_name)
         if mesh is None or mesh.is_empty:
             link_spheres[link_name] = []
+            link_cuboids[link_name] = []
             continue
 
-        link_spheres[link_name] = spherize(mesh, budget, params)
+        spheres: list[Sphere] = []
+        cuboids: list[Cuboid] = []
+        if mode == "sphere":
+            spheres = spherize(mesh, budget, params)
+        elif mode == "cuboid":
+            cuboids = cuboidize(mesh, budget, params)
+        elif mode == "auto":
+            cand_s = spherize(mesh, budget, params)
+            cand_c = cuboidize(mesh, budget, params)
+            score_s = _auto_slack(mesh, cand_s, [])
+            score_c = _auto_slack(mesh, [], cand_c)
+            logger.debug(
+                f"auto[{link_name}]: spheres={score_s:.2f}, cuboids={score_c:.2f}"
+            )
+            if score_c < score_s:
+                cuboids = cand_c
+            else:
+                spheres = cand_s
+        else:
+            raise ValueError(f"Unknown primitive mode: {mode!r}")
 
-    return RobotSpheresResult(link_spheres=link_spheres)
+        link_spheres[link_name] = spheres
+        link_cuboids[link_name] = cuboids
+
+    # Drop empty cuboid entries to keep the result compact.
+    link_cuboids = {k: v for k, v in link_cuboids.items() if v}
+    return RobotSpheresResult(link_spheres=link_spheres, link_cuboids=link_cuboids)
 
 
 def _transform_spheres(spheres: list[Sphere], transform: np.ndarray) -> list[Sphere]:

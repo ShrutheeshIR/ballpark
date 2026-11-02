@@ -26,7 +26,6 @@ from viser.extras import ViserUrdf
 from ballpark import (
     Robot,
     RobotSpheresResult,
-    Sphere,
     SPHERE_COLORS,
     BallparkConfig,
     SpherizeParams,
@@ -96,13 +95,21 @@ def main(
             config = gui.get_config()
             if target_spheres > 0:
                 t0 = time.perf_counter()
-                result = robot.spherize(allocation=allocation, config=config)
+                result = robot.spherize(
+                    allocation=allocation,
+                    config=config,
+                    link_modes=gui.link_modes,  # type: ignore[arg-type]
+                    default_mode=gui.default_mode,  # type: ignore[arg-type]
+                )
                 elapsed = (time.perf_counter() - t0) * 1000
-                print(f"Generated {result.num_spheres} spheres in {elapsed:.1f}ms")
+                print(
+                    f"Generated {result.num_spheres} spheres, "
+                    f"{result.num_cuboids} cuboids in {elapsed:.1f}ms"
+                )
             else:
                 result = RobotSpheresResult(link_spheres={})
 
-            gui.update_sphere_count(result.num_spheres)
+            gui.update_sphere_count(result.num_primitives)
             gui.mark_spherized()
             gui.set_needs_refine_update()  # Trigger refine after spherize
 
@@ -113,7 +120,7 @@ def main(
         # Re-refine when refine settings changed OR after new spherize
         if gui.needs_refine_update and result is not None:
             config = gui.get_config()
-            if gui.refine_enabled and result.num_spheres > 0:
+            if gui.refine_enabled and result.num_spheres > 0:  # cuboids pass through
                 t0 = time.perf_counter()
                 refined = robot.refine(
                     result,
@@ -167,6 +174,8 @@ class _SpheresGui:
         self._last_show: bool = True
         self._last_opacity: float = 0.9
         self._last_refine: bool = False
+        self._last_modes: dict[str, str] = {}
+        self._last_default_mode: str = "sphere"
         self._last_preset: str = "Balanced"
         self._last_params: dict[str, float] = {}
         self._last_joint_config: np.ndarray | None = None  # Track joint config changes
@@ -237,6 +246,22 @@ class _SpheresGui:
                             disabled=True,
                         )
 
+            with server.gui.add_folder("Primitive"):
+                self._default_primitive = server.gui.add_dropdown(
+                    "Default", options=["Sphere", "Cuboid", "Auto"], initial_value="Sphere"
+                )
+                self._link_primitives: dict[str, viser.GuiInputHandle] = {}
+                with server.gui.add_folder("Per-Link", expand_by_default=False):
+                    for link_name in robot.collision_links:
+                        display = (
+                            link_name[:20] + "..." if len(link_name) > 20 else link_name
+                        )
+                        self._link_primitives[link_name] = server.gui.add_dropdown(
+                            display,
+                            options=["Default", "Sphere", "Cuboid", "Auto"],
+                            initial_value="Default",
+                        )
+
             with server.gui.add_folder("Export"):
                 self._export_filename = server.gui.add_text(
                     "Filename", initial_value="spheres.json"
@@ -305,6 +330,15 @@ class _SpheresGui:
                             self._needs_refine_update = True
 
                 self._last_params = current_params
+
+        # Primitive type change - affects spherize
+        current_modes = self.link_modes
+        if current_modes != self._last_modes or (
+            self._default_primitive.value.lower() != self._last_default_mode
+        ):
+            self._last_modes = current_modes
+            self._last_default_mode = self._default_primitive.value.lower()
+            self._needs_spherize = True
 
         # Mode change - affects allocation
         if self._mode.value != self._last_mode:
@@ -588,6 +622,19 @@ class _SpheresGui:
         return self._skipped_pairs.copy()
 
     @property
+    def default_mode(self) -> str:
+        return self._default_primitive.value.lower()
+
+    @property
+    def link_modes(self) -> dict[str, str]:
+        """Per-link primitive overrides ("Default" entries are omitted)."""
+        return {
+            name: dd.value.lower()
+            for name, dd in self._link_primitives.items()
+            if dd.value != "Default"
+        }
+
+    @property
     def needs_spherize(self) -> bool:
         return self._needs_spherize
 
@@ -640,14 +687,14 @@ class _SpheresGui:
 
 
 class _SphereVisuals:
-    """Manages sphere visualization in viser."""
+    """Manages sphere and cuboid visualization in viser."""
 
     def __init__(self, server: viser.ViserServer, link_names: list[str]):
         self._server = server
         self._link_names = link_names
         self._frames: dict[str, viser.FrameHandle] = {}
-        self._handles: dict[str, viser.IcosphereHandle] = {}
-        self._link_spheres: dict[str, list[Sphere]] = {}
+        self._handles: dict[str, viser.SceneNodeHandle] = {}
+        self._link_keys: dict[str, list[str]] = {}
 
     def update(
         self,
@@ -655,7 +702,7 @@ class _SphereVisuals:
         opacity: float,
         visible: bool,
     ) -> None:
-        """Rebuild sphere visuals from result."""
+        """Rebuild primitive visuals from result."""
         # Clear existing
         for h in self._handles.values():
             h.remove()
@@ -663,28 +710,30 @@ class _SphereVisuals:
             f.remove()
         self._handles.clear()
         self._frames.clear()
-        self._link_spheres = result.link_spheres
+        self._link_keys = {}
 
         if not visible:
             return
 
         for link_idx, link_name in enumerate(self._link_names):
-            spheres = self._link_spheres.get(link_name, [])
-            if not spheres:
+            spheres = result.link_spheres.get(link_name, [])
+            cuboids = result.link_cuboids.get(link_name, [])
+            if not spheres and not cuboids:
                 continue
 
             color = SPHERE_COLORS[link_idx % len(SPHERE_COLORS)]
             rgb = (color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
+            keys = self._link_keys.setdefault(link_name, [])
 
             for sphere_idx, sphere in enumerate(spheres):
                 key = f"{link_name}_{sphere_idx}"
-                frame = self._server.scene.add_frame(
+                self._frames[key] = self._server.scene.add_frame(
                     f"/sphere_frames/{key}",
                     wxyz=(1, 0, 0, 0),
                     position=(0, 0, 0),
                     show_axes=False,
                 )
-                self._frames[key] = frame
+                keys.append(key)
                 center = sphere.center
                 self._handles[key] = self._server.scene.add_icosphere(
                     f"/sphere_frames/{key}/sphere",
@@ -694,18 +743,30 @@ class _SphereVisuals:
                     opacity=opacity,
                 )
 
-    def update_transforms(self, Ts_link_world: np.ndarray) -> None:
-        """Update sphere positions from link transforms."""
-        for link_idx, link_name in enumerate(self._link_names):
-            spheres = self._link_spheres.get(link_name, [])
-            if not spheres:
-                continue
+            for cuboid_idx, cuboid in enumerate(cuboids):
+                key = f"{link_name}_cuboid_{cuboid_idx}"
+                self._frames[key] = self._server.scene.add_frame(
+                    f"/sphere_frames/{key}",
+                    wxyz=(1, 0, 0, 0),
+                    position=(0, 0, 0),
+                    show_axes=False,
+                )
+                keys.append(key)
+                self._handles[key] = self._server.scene.add_box(
+                    f"/sphere_frames/{key}/cuboid",
+                    dimensions=tuple(2.0 * np.asarray(cuboid.half_extents)),
+                    wxyz=np.asarray(cuboid.wxyz),
+                    position=np.asarray(cuboid.center),
+                    color=rgb,
+                    opacity=opacity,
+                )
 
+    def update_transforms(self, Ts_link_world: np.ndarray) -> None:
+        """Update primitive poses from link transforms."""
+        for link_idx, link_name in enumerate(self._link_names):
             T = Ts_link_world[link_idx]
             wxyz, pos = T[:4], T[4:]
-
-            for sphere_idx in range(len(spheres)):
-                key = f"{link_name}_{sphere_idx}"
+            for key in self._link_keys.get(link_name, []):
                 if key in self._frames:
                     self._frames[key].wxyz = wxyz
                     self._frames[key].position = pos

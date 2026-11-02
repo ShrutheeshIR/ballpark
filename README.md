@@ -70,9 +70,33 @@ for link_name, spheres in result.link_spheres.items():
     print(f"{link_name}: {len(spheres)} spheres")
 ```
 
+### Spheres and/or Cuboids per Link
+
+Each link can be approximated with spheres, oriented cuboids, or whichever is tighter:
+
+```python
+result = robot.spherize(
+    target_spheres=100,
+    link_modes={"panda_link2": "cuboid", "panda_link6": "auto"},  # per-link
+    default_mode="sphere",  # everything else
+)
+result.link_spheres  # dict[str, list[Sphere]]
+result.link_cuboids  # dict[str, list[Cuboid]]  (center, half_extents, wxyz in link frame)
+```
+
+For a single mesh, use `ballpark.cuboidize(mesh, target_cuboids=8)`. Notes:
+- For cuboid links the budget is the *maximum* number of boxes; a tight box is not split.
+- `"auto"` fits both at the same primitive count and keeps the one with less excess volume.
+- Links in a similarity group follow the group's primary link (a warning is logged on mismatch).
+- `robot.refine()` optimizes spheres only. Cuboids are kept as-is, and spheres on
+  non-adjacent links are pushed out of them.
+- JSON export adds a `"cuboids"` entry (`centers`, `half_extents`, `wxyz`) to links that have
+  cuboids; sphere-only files are unchanged. CLI: `spherize_robot.py --default-mode auto
+  --cuboid-links panda_link2`.
+
 ### Manual Sphere Adjustments
 
-We include an interactive script for adjusting the pose + radii of the auto-generated spheres. 
+We include an interactive script for adjusting the pose + radii of the auto-generated spheres (cuboids in the JSON are preserved on save, but not shown or editable there).
 
 https://github.com/user-attachments/assets/895bbf5f-e4db-47c2-8946-cb5f2dbbb9b9
 
